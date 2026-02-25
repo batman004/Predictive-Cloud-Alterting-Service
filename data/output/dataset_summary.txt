@@ -1,5 +1,0 @@
-W=24, H=3, STEP=1
-train=42267, val=8732, test=9154
-train_pos=63
-val_pos=12
-test_pos=15
