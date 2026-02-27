@@ -1,9 +1,10 @@
 """Unified CLI entry point for the predictive cloud alerting pipeline.
 
 Usage:
-    python cli.py train   [--out ARTIFACTS_DIR]
+    python cli.py train   [--artifacts ARTIFACTS_DIR]
     python cli.py evaluate [--artifacts ARTIFACTS_DIR]
     python cli.py predict  --source SOURCE_NAME [--artifacts ARTIFACTS_DIR]
+    python cli.py stream   --input METRICS.csv [--source ID]  # SSE output when threshold crossed
 """
 from __future__ import annotations
 
@@ -23,8 +24,9 @@ from src.ml.features import (
 from src.ml.trainer import train as train_model
 from src.ml.evaluator import evaluate as evaluate_model
 from src.ml.predictor import Predictor
-from src.pipeline.ingest import NABClient
+from src.pipeline.ingest import NABClient, read_metric_stream
 from src.pipeline.alert_engine import AlertEngine
+from src.pipeline.notifier import ArchivingNotifier, SSENotifier, StdoutNotifier
 
 
 ARTIFACTS_DEFAULT = Path("artifacts")
@@ -139,7 +141,10 @@ def cmd_predict(args: argparse.Namespace) -> None:
     logger.info("Running alerting pipeline on {}", source_id)
 
     raw = client.load_series(filename)
-    engine = AlertEngine(predictor, cfg)
+    notifier: StdoutNotifier | ArchivingNotifier = StdoutNotifier()
+    if getattr(args, "alert_log", None):
+        notifier = ArchivingNotifier(notifier, args.alert_log)
+    engine = AlertEngine(predictor, cfg, notifier=notifier)
     alerts = engine.run_on_series(
         raw["timestamp"].values, raw["value"].values, source_id,
     )
@@ -148,6 +153,36 @@ def cmd_predict(args: argparse.Namespace) -> None:
         "Finished. {} alerts fired across {} data points.",
         len(alerts), len(raw),
     )
+
+
+# ── stream ───────────────────────────────────────────────────────────────────
+
+def cmd_stream(args: argparse.Namespace) -> None:
+    """Read metrics from a file (or stdin) in a stream; output SSE events when
+    the model predicts an incident (threshold crossed)."""
+    cfg = Config()
+    out = Path(args.artifacts)
+    source_id = args.source or "stream"
+
+    predictor = Predictor(
+        out / "models" / "model.joblib",
+        out / "models" / "threshold.json",
+    )
+    notifier: SSENotifier | ArchivingNotifier = SSENotifier()
+    if getattr(args, "alert_log", None):
+        notifier = ArchivingNotifier(notifier, args.alert_log)
+    engine = AlertEngine(predictor, cfg, notifier=notifier)
+
+    # Optional: send SSE comment so clients know the stream started
+    sys.stdout.write(": stream started\n\n")
+    sys.stdout.flush()
+
+    count = 0
+    for ts, value in read_metric_stream(args.input):
+        count += 1
+        engine.ingest(ts, value, source_id)
+
+    logger.info("Stream finished. {} points processed, {} alerts fired.", count, len(engine.alerts_fired))
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -172,6 +207,14 @@ def main() -> None:
     p_pred.add_argument("--source", required=True, help="Source name (partial match)")
     p_pred.add_argument("--artifacts", default=str(ARTIFACTS_DEFAULT))
     p_pred.add_argument("--local-nab", default=None, help="Path to local NAB clone")
+    p_pred.add_argument("--alert-log", default=None, help="Append alerts to this file (JSON lines) for archival")
+
+    # stream: read file in stream, output SSE when threshold crossed
+    p_stream = sub.add_parser("stream", help="Stream metrics from file/stdin; output SSE events on threshold")
+    p_stream.add_argument("--input", default="-", help="Path to CSV (timestamp,value) or '-' for stdin")
+    p_stream.add_argument("--source", default="stream", help="Source id for alert payloads")
+    p_stream.add_argument("--artifacts", default=str(ARTIFACTS_DEFAULT))
+    p_stream.add_argument("--alert-log", default=None, help="Append alerts to this file (JSON lines) for archival")
 
     args = parser.parse_args()
 
@@ -181,6 +224,8 @@ def main() -> None:
         cmd_evaluate(args)
     elif args.command == "predict":
         cmd_predict(args)
+    elif args.command == "stream":
+        cmd_stream(args)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import io
 import json
+import sys
 from pathlib import Path
+from typing import Iterator
 
 import pandas as pd
 import requests
@@ -42,3 +45,34 @@ class NABClient:
         df = df[["timestamp", "value"]].sort_values("timestamp").reset_index(drop=True)
         df["value"] = df["value"].ffill()
         return df.dropna(subset=["value"]).reset_index(drop=True)
+
+
+def read_metric_stream(
+    input_path: str,
+) -> Iterator[tuple[str, float]]:
+    """Read a CSV stream (file or stdin) line-by-line; yield (timestamp, value).
+
+    Expects columns: timestamp, value. First row is skipped if it looks like a header
+    (e.g. contains 'timestamp'). Use input_path='-' for stdin.
+    """
+    if input_path == "-":
+        f = sys.stdin
+    else:
+        f = open(input_path, newline="", encoding="utf-8")
+
+    try:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            ts = str(row[0]).strip()
+            if ts.lower() in ("timestamp", "time", ""):
+                continue
+            try:
+                val = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            yield ts, val
+    finally:
+        if input_path != "-":
+            f.close()

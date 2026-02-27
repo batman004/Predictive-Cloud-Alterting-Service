@@ -8,7 +8,7 @@ from loguru import logger
 from src.config import Config
 from src.ml.features import extract_features
 from src.ml.predictor import Predictor
-from src.pipeline.notifier import Alert, StdoutNotifier
+from src.pipeline.notifier import Alert, ArchivingNotifier, SSENotifier, StdoutNotifier
 
 
 class AlertEngine:
@@ -20,7 +20,7 @@ class AlertEngine:
         self,
         predictor: Predictor,
         cfg: Config,
-        notifier: StdoutNotifier | None = None,
+        notifier: StdoutNotifier | SSENotifier | ArchivingNotifier | None = None,
     ):
         self.predictor = predictor
         self.cfg = cfg

@@ -18,9 +18,9 @@ src/
 │   ├── evaluator.py       # Point-level (precision/recall/AUC) + incident-level metrics
 │   └── predictor.py       # Loads trained model, returns (probability, should_alert)
 └── pipeline/
-    ├── ingest.py          # NAB dataset client (swap for CloudWatch/Prometheus later)
+    ├── ingest.py          # NAB client + read_metric_stream() for file/stdin CSV stream
     ├── alert_engine.py    # Rolling buffer, cooldown, severity bands
-    └── notifier.py        # Structured JSON alerts to stdout
+    └── notifier.py        # StdoutNotifier (JSON lines), SSENotifier (Server-Sent Events)
 ```
 
 ## Quick Start
@@ -54,6 +54,36 @@ Streams through the time series chronologically, simulating real-time data arriv
 
 ```json
 {"timestamp": "2014-02-17T00:17:00", "source": "ec2_cpu_utilization_fe7f93", "probability": 0.9653, "severity": "critical", "message": "Predicted incident within 15 minutes"}
+```
+
+### Stream input and SSE output
+
+Read a metrics file in a stream (line-by-line) and emit **Server-Sent Events (SSE)** when the predicted probability crosses the threshold:
+
+```bash
+python cli.py stream --input path/to/metrics.csv --source my-service
+```
+
+Input CSV must have two columns: `timestamp`, `value`. Use `-` for stdin:
+
+```bash
+cat metrics.csv | python cli.py stream --input - --source my-service
+```
+
+SSE output (one event per alert):
+
+```
+event: alert
+data: {"timestamp": "2024-01-15T12:00:00", "source": "my-service", "probability": 0.85, "severity": "warning", "message": "Predicted incident within 15 minutes"}
+
+```
+
+You can point an EventSource (or any SSE client) at a process that runs this and pipes stdout; or wrap it in an HTTP endpoint that sets `Content-Type: text/event-stream` and streams the same output.
+
+**Alert log (archival):** For both `predict` and `stream`, use `--alert-log PATH` to append every alert as a JSON line to a file for archival:
+
+```bash
+python cli.py stream --input metrics.csv --alert-log alerts.jsonl
 ```
 
 ### Docker
