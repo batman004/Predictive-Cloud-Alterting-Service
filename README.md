@@ -2,6 +2,26 @@
 
 A production-ready pipeline that predicts incidents in cloud services before they occur, using historical metric data from AWS CloudWatch.
 
+## Table of Contents
+
+- [Architecture](#architecture)
+  - [Predict / Stream (real-time alerting)](#predict--stream-real-time-alerting)
+- [Quick Start](#quick-start)
+  - [Prerequisites](#prerequisites)
+  - [Train the model](#train-the-model)
+  - [Evaluate a saved model](#evaluate-a-saved-model)
+  - [Run the alerting pipeline](#run-the-alerting-pipeline)
+  - [Stream input and SSE output](#stream-input-and-sse-output)
+  - [Docker](#docker)
+- [How It Works](#how-it-works)
+  - [Problem Formulation](#problem-formulation)
+  - [Feature Set (8 features)](#feature-set-8-features)
+  - [Labeling](#labeling)
+  - [Alert Engine](#alert-engine)
+  - [Dataset](#dataset)
+- [Design Decisions](#design-decisions)
+- [Limitations and Future Work](#limitations-and-future-work)
+
 ## Architecture
 
 The system is split into two layers:
@@ -9,18 +29,36 @@ The system is split into two layers:
 - **ML layer** (`src/ml/`) -- stateless, pure functions: feature extraction, model training, evaluation, inference. Swap the model without touching the pipeline.
 - **Pipeline layer** (`src/pipeline/`) -- owns state and I/O: data ingestion, rolling-window alert engine with cooldown logic, structured JSON notification output.
 
-```
-src/
-├── config.py              # Frozen dataclass -- single source of truth for all parameters
-├── ml/
-│   ├── features.py        # 8 statistical features, onset labeling, sliding window, temporal split
-│   ├── trainer.py         # XGBoost training with class-imbalance handling + threshold tuning
-│   ├── evaluator.py       # Point-level (precision/recall/AUC) + incident-level metrics
-│   └── predictor.py       # Loads trained model, returns (probability, should_alert)
-└── pipeline/
-    ├── ingest.py          # NAB client + read_metric_stream() for file/stdin CSV stream
-    ├── alert_engine.py    # Rolling buffer, cooldown, severity bands
-    └── notifier.py        # StdoutNotifier (JSON lines), SSENotifier (Server-Sent Events)
+### Predict / Stream (real-time alerting)
+
+```mermaid
+flowchart LR
+    subgraph In["Input"]
+        TS["timestamps"]
+        V["values"]
+    end
+
+    subgraph Engine["AlertEngine"]
+        B["Rolling buffer(size W)"]
+        F["extract features"]
+        P["Predictor should alert"]
+        Cooldown["Cooldown + severity"]
+    end
+
+    subgraph Out["Output"]
+        Stdout["JSON stdout"]
+        SSE["SSE events"]
+        Log["alert logging"]
+    end
+
+    TS --> B
+    V --> B
+    B --> F
+    F --> P
+    P --> Cooldown
+    Cooldown --> Stdout
+    Cooldown --> SSE
+    Cooldown --> Log
 ```
 
 ## Quick Start
@@ -36,7 +74,12 @@ src/
 python cli.py train
 ```
 
-This downloads 17 AWS CloudWatch time series from the NAB dataset, extracts features, trains an XGBoost classifier, tunes the alert threshold, and evaluates on a held-out test set. Artifacts are saved to `artifacts/`.
+This downloads 17 AWS CloudWatch time series from the NAB dataset, extracts features, and trains:
+
+- **Global model** — one model on all series (saved under `artifacts/models/global/`).
+- **Per-metric models** — one model per metric type: `ec2_cpu`, `ec2_disk`, `ec2_network`, `elb`, `asg`, `rds_cpu` (saved under `artifacts/models/{key}/`).
+
+Each run also evaluates and writes reports to `artifacts/reports/` (global) and `artifacts/reports/{key}/` (per-metric). A `manifest.json` in `artifacts/models/` lists all trained model keys.
 
 ### Evaluate a saved model
 
@@ -50,7 +93,7 @@ python cli.py evaluate
 python cli.py predict --source ec2_cpu_utilization_fe7f93
 ```
 
-Streams through the time series chronologically, simulating real-time data arrival. Fires structured JSON alerts to stdout when the model predicts an incident:
+The CLI selects the model automatically: if a per-metric model exists for that source (e.g. `ec2_cpu` for CPU utilization series), it is used; otherwise the global model is used. Streams through the time series chronologically and fires structured JSON alerts to stdout when the model predicts an incident:
 
 ```json
 {"timestamp": "2014-02-17T00:17:00", "source": "ec2_cpu_utilization_fe7f93", "probability": 0.9653, "severity": "critical", "message": "Predicted incident within 15 minutes"}

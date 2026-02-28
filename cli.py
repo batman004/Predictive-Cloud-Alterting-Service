@@ -14,7 +14,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from src.config import Config
+from src.config import Config, get_metric_key, get_metric_key_from_source
 from src.ml.features import (
     FEATURE_NAMES,
     build_window_df,
@@ -31,6 +31,52 @@ from src.pipeline.notifier import ArchivingNotifier, SSENotifier, StdoutNotifier
 
 ARTIFACTS_DEFAULT = Path("artifacts")
 
+# Minimum rows per split to train a per-metric model
+MIN_TRAIN_ROWS = 100
+
+
+def _build_dataset(filenames, client, windows_map, cfg):
+    """Build train/val/test DataFrames from a list of NAB filenames. Returns (train_df, val_df, test_df) or None."""
+    import pandas as pd
+    all_train, all_val, all_test = [], [], []
+    for filename in filenames:
+        source_id = Path(filename).stem
+        try:
+            raw = client.load_series(filename)
+        except Exception as exc:
+            logger.error("{} load failed: {}", source_id, exc)
+            continue
+        labeled = label_series(raw, windows_map.get(filename, []), cfg.H)
+        windowed = build_window_df(labeled, source_id, cfg)
+        if len(windowed) < 10:
+            continue
+        tr, va, te = temporal_split(windowed, cfg)
+        if min(len(tr), len(va), len(te)) == 0:
+            continue
+        all_train.append(tr)
+        all_val.append(va)
+        all_test.append(te)
+        pos = int((tr["label"] == 1).sum())
+        logger.info("  {} -> {} windows (pos_train={})", source_id, len(windowed), pos)
+    if not all_train:
+        return None
+    train_df = pd.concat(all_train, ignore_index=True)
+    val_df = pd.concat(all_val, ignore_index=True)
+    test_df = pd.concat(all_test, ignore_index=True)
+    return train_df, val_df, test_df
+
+
+def _get_model_dir(artifacts_root: Path, source_id: str | None, cfg: Config) -> Path:
+    """Return the model directory to use: per-metric if available, else global. Supports legacy layout."""
+    models_root = artifacts_root / "models"
+    if source_id:
+        key = get_metric_key_from_source(source_id, cfg.aws_files)
+        if key and (models_root / key / "model.joblib").exists():
+            return models_root / key
+    if (models_root / "global" / "model.joblib").exists():
+        return models_root / "global"
+    return models_root
+
 
 # ── train ────────────────────────────────────────────────────────────────────
 
@@ -45,62 +91,71 @@ def cmd_train(args: argparse.Namespace) -> None:
     windows_map = client.load_windows()
 
     import pandas as pd
-    all_train, all_val, all_test = [], [], []
+    import json
 
-    for filename in cfg.aws_files:
-        source_id = Path(filename).stem
-        try:
-            raw = client.load_series(filename)
-        except Exception as exc:
-            logger.error("{} load failed: {}", source_id, exc)
-            continue
-
-        labeled = label_series(raw, windows_map.get(filename, []), cfg.H)
-        windowed = build_window_df(labeled, source_id, cfg)
-
-        if len(windowed) < 10:
-            logger.warning("{} skipped (too few windows)", source_id)
-            continue
-
-        tr, va, te = temporal_split(windowed, cfg)
-        if min(len(tr), len(va), len(te)) == 0:
-            logger.warning("{} skipped (empty split)", source_id)
-            continue
-
-        all_train.append(tr)
-        all_val.append(va)
-        all_test.append(te)
-        pos = int((tr["label"] == 1).sum())
-        logger.info("{} -> {} windows (pos_train={})", source_id, len(windowed), pos)
-
-    if not all_train:
+    # ---- Global model (all series) ----
+    logger.info("Building global dataset (all series)")
+    result = _build_dataset(list(cfg.aws_files), client, windows_map, cfg)
+    if result is None:
         logger.error("No series processed successfully.")
         sys.exit(1)
-
-    train_df = pd.concat(all_train, ignore_index=True)
-    val_df = pd.concat(all_val, ignore_index=True)
-    test_df = pd.concat(all_test, ignore_index=True)
-
+    train_df, val_df, test_df = result
     data_dir.mkdir(parents=True, exist_ok=True)
     train_df.to_csv(data_dir / "train.csv", index=False)
     val_df.to_csv(data_dir / "val.csv", index=False)
     test_df.to_csv(data_dir / "test.csv", index=False)
-    logger.info(
-        "Datasets saved: train={}, val={}, test={}",
-        len(train_df), len(val_df), len(test_df),
-    )
+    logger.info("Global: train={}, val={}, test={}", len(train_df), len(val_df), len(test_df))
 
-    train_model(data_dir / "train.csv", data_dir / "val.csv", model_dir, cfg)
-
+    global_dir = model_dir / "global"
+    global_dir.mkdir(parents=True, exist_ok=True)
+    train_model(data_dir / "train.csv", data_dir / "val.csv", global_dir, cfg)
     evaluate_model(
         data_dir / "test.csv",
-        model_dir / "model.joblib",
-        model_dir / "threshold.json",
+        global_dir / "model.joblib",
+        global_dir / "threshold.json",
         report_dir,
         cfg,
     )
 
-    logger.info("Training pipeline complete. Artifacts in {}", out)
+    # ---- Per-metric models ----
+    from collections import defaultdict
+    by_key = defaultdict(list)
+    for f in cfg.aws_files:
+        by_key[get_metric_key(f)].append(f)
+
+    manifest = ["global"]
+    for key, filenames in sorted(by_key.items()):
+        if key == "other":
+            continue
+        logger.info("Building dataset for metric key '{}' ({} series)", key, len(filenames))
+        result = _build_dataset(filenames, client, windows_map, cfg)
+        if result is None:
+            logger.warning("  {}: skipped (no data)", key)
+            continue
+        train_df, val_df, test_df = result
+        if len(train_df) < MIN_TRAIN_ROWS:
+            logger.warning("  {}: skipped (too few rows: {})", key, len(train_df))
+            continue
+        key_dir = model_dir / key
+        key_dir.mkdir(parents=True, exist_ok=True)
+        key_data = data_dir / key
+        key_data.mkdir(parents=True, exist_ok=True)
+        train_df.to_csv(key_data / "train.csv", index=False)
+        val_df.to_csv(key_data / "val.csv", index=False)
+        test_df.to_csv(key_data / "test.csv", index=False)
+        train_model(key_data / "train.csv", key_data / "val.csv", key_dir, cfg)
+        key_report = report_dir / key
+        evaluate_model(
+            key_data / "test.csv",
+            key_dir / "model.joblib",
+            key_dir / "threshold.json",
+            key_report,
+            cfg,
+        )
+        manifest.append(key)
+
+    (model_dir / "manifest.json").write_text(json.dumps({"models": manifest}, indent=2))
+    logger.info("Training complete. Models: {}", manifest)
 
 
 # ── evaluate ─────────────────────────────────────────────────────────────────
@@ -108,11 +163,12 @@ def cmd_train(args: argparse.Namespace) -> None:
 def cmd_evaluate(args: argparse.Namespace) -> None:
     cfg = Config()
     out = Path(args.artifacts)
+    model_dir = _get_model_dir(out, None, cfg)
 
     evaluate_model(
         out / "data" / "test.csv",
-        out / "models" / "model.joblib",
-        out / "models" / "threshold.json",
+        model_dir / "model.joblib",
+        model_dir / "threshold.json",
         out / "reports",
         cfg,
     )
@@ -124,13 +180,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
     cfg = Config()
     out = Path(args.artifacts)
 
-    predictor = Predictor(
-        out / "models" / "model.joblib",
-        out / "models" / "threshold.json",
-    )
-
     client = NABClient(cfg, local_path=args.local_nab)
-
     matching = [f for f in cfg.aws_files if args.source in f]
     if not matching:
         logger.error("No source matching '{}'. Available: {}", args.source, cfg.aws_files)
@@ -138,7 +188,13 @@ def cmd_predict(args: argparse.Namespace) -> None:
 
     filename = matching[0]
     source_id = Path(filename).stem
-    logger.info("Running alerting pipeline on {}", source_id)
+    model_dir = _get_model_dir(out, source_id, cfg)
+    logger.info("Using model {} for source {}", model_dir.name, source_id)
+
+    predictor = Predictor(
+        model_dir / "model.joblib",
+        model_dir / "threshold.json",
+    )
 
     raw = client.load_series(filename)
     notifier: StdoutNotifier | ArchivingNotifier = StdoutNotifier()
@@ -163,10 +219,12 @@ def cmd_stream(args: argparse.Namespace) -> None:
     cfg = Config()
     out = Path(args.artifacts)
     source_id = args.source or "stream"
+    model_dir = _get_model_dir(out, source_id, cfg)
+    logger.info("Using model {} for source {}", model_dir.name, source_id)
 
     predictor = Predictor(
-        out / "models" / "model.joblib",
-        out / "models" / "threshold.json",
+        model_dir / "model.joblib",
+        model_dir / "threshold.json",
     )
     notifier: SSENotifier | ArchivingNotifier = SSENotifier()
     if getattr(args, "alert_log", None):

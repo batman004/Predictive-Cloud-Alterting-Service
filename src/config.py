@@ -1,6 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def get_metric_key(rel_path: str) -> str:
+    """Map a NAB file path to a metric type key for per-metric models."""
+    name = Path(rel_path).stem.lower()
+    if "ec2_cpu_utilization" in name or name.startswith("ec2_cpu"):
+        return "ec2_cpu"
+    if "ec2_disk_write" in name:
+        return "ec2_disk"
+    if "ec2_network_in" in name or "networkin" in name:
+        return "ec2_network"
+    if "elb_request" in name:
+        return "elb"
+    if "grok_asg" in name or "asg_anomaly" in name:
+        return "asg"
+    if "rds_cpu_utilization" in name:
+        return "rds_cpu"
+    return "other"
+
+
+def get_metric_key_from_source(source_id: str, aws_files: tuple[str, ...]) -> str | None:
+    """Resolve source_id (e.g. from --source) to a metric key if it matches a known series."""
+    source_lower = source_id.lower()
+    for rel_path in aws_files:
+        stem = Path(rel_path).stem.lower()
+        if source_lower in stem or stem in source_lower:
+            return get_metric_key(rel_path)
+    return None
 
 
 @dataclass(frozen=True)
@@ -9,7 +38,7 @@ class Config:
 
     # sliding-window parameters
     W: int = 24
-    H: int = 3
+    H: int = 12
     step: int = 1
 
     # train / val / test split fractions

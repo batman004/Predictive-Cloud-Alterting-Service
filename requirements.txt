@@ -4,4 +4,5 @@ requests
 loguru
 xgboost>=2.0,<3
 scikit-learn
+imbalanced-learn
 joblib

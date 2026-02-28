@@ -6,9 +6,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from sklearn.metrics import (
-    auc,
     average_precision_score,
-    precision_recall_curve,
     roc_auc_score,
 )
 
