@@ -73,10 +73,25 @@ def train(
     val_df = pd.read_csv(val_csv)
 
     feature_cols = [c for c in FEATURE_NAMES if c in train_df.columns]
-    X_train = train_df[feature_cols].values
+    X_train = train_df[feature_cols].values.astype(np.float64)
     y_train = (train_df["label"] == 1).astype(int).values
-    X_val = val_df[feature_cols].values
+    X_val = val_df[feature_cols].values.astype(np.float64)
     y_val = (val_df["label"] == 1).astype(int).values
+
+    # Z-score normalize using training stats; save for inference
+    mean = np.nanmean(X_train, axis=0)
+    std = np.nanstd(X_train, axis=0)
+    std = np.where(std > 1e-9, std, 1.0)
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
+    feature_stats = {
+        "feature_names": feature_cols,
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+    }
+    stats_path = out_dir / "feature_stats.json"
+    stats_path.write_text(json.dumps(feature_stats, indent=2))
+    logger.info("Feature stats saved to {}", stats_path)
 
     neg, pos = int((y_train == 0).sum()), int((y_train == 1).sum())
     logger.info("Raw training samples={} (pos={}, neg={})", len(y_train), pos, neg)

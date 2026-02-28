@@ -21,18 +21,22 @@ class AlertEngine:
         predictor: Predictor,
         cfg: Config,
         notifier: StdoutNotifier | SSENotifier | ArchivingNotifier | None = None,
+        debug: bool = False,
     ):
         self.predictor = predictor
         self.cfg = cfg
         self.notifier = notifier or StdoutNotifier()
+        self.debug = debug
         self.buffer: deque[float] = deque(maxlen=cfg.W)
         self.steps_since_alert: float = float("inf")
         self.alerts_fired: list[Alert] = []
+        self.max_prob_seen: float = 0.0
 
     def reset(self) -> None:
         self.buffer.clear()
         self.steps_since_alert = float("inf")
         self.alerts_fired = []
+        self.max_prob_seen = 0.0
 
     def ingest(self, timestamp: str, value: float, source: str) -> Alert | None:
         """Process a single data point. Returns an Alert if one was fired."""
@@ -44,6 +48,10 @@ class AlertEngine:
 
         features = extract_features(np.array(self.buffer))
         prob, should_alert = self.predictor.predict(features)
+        if self.debug:
+            self.max_prob_seen = max(self.max_prob_seen, prob)
+            if prob > 0.15:
+                logger.debug("step prob={:.3f} (threshold={:.2f}) ts={}", prob, self.predictor.threshold, timestamp)
 
         if not should_alert:
             return None

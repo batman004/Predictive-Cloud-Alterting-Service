@@ -8,6 +8,7 @@ from src.config import Config
 FEATURE_NAMES = (
     "mean", "std", "min", "max",
     "trend_slope", "mean_change", "max_abs_change", "autocorr_lag1",
+    "range", "last_value", "coeff_of_var",
 )
 
 
@@ -58,15 +59,23 @@ def extract_features(series: np.ndarray) -> dict[str, float]:
     else:
         autocorr = 0.0
 
+    s_mean = float(series.mean())
+    s_std = float(series.std())
+    s_min = float(series.min())
+    s_max = float(series.max())
+
     feats = {
-        "mean": float(series.mean()),
-        "std": float(series.std()),
-        "min": float(series.min()),
-        "max": float(series.max()),
+        "mean": s_mean,
+        "std": s_std,
+        "min": s_min,
+        "max": s_max,
         "trend_slope": float(slope),
         "mean_change": float(diffs.mean()) if len(diffs) else 0.0,
         "max_abs_change": float(np.abs(diffs).max()) if len(diffs) else 0.0,
         "autocorr_lag1": autocorr,
+        "range": s_max - s_min,
+        "last_value": float(series[-1]),
+        "coeff_of_var": s_std / abs(s_mean) if abs(s_mean) > 1e-9 else 0.0,
     }
     for k, v in feats.items():
         if not np.isfinite(v):
@@ -78,7 +87,8 @@ def build_window_df(
     df: pd.DataFrame, source_id: str, cfg: Config,
 ) -> pd.DataFrame:
     """Slide a window of size W across the labeled series and produce a feature DataFrame.
-    Skips windows where an incident is already in progress (label=-1)."""
+    Skips windows where an incident is already in progress (label=-1).
+    Returns raw features; normalization is done at training time and applied at inference via saved stats."""
     values = df["value"].values
     labels = df["label"].values
     timestamps = df["timestamp"].values

@@ -114,7 +114,7 @@ def evaluate(
     feature_cols = [c for c in FEATURE_NAMES if c in test_df.columns]
     X_test = test_df[feature_cols].values
     y_true = (test_df["label"] == 1).astype(int).values
-    y_prob = predictor.model.predict_proba(X_test)[:, 1]
+    y_prob = predictor.predict_proba_batch(X_test)
 
     pm = point_metrics(y_true, y_prob, predictor.threshold)
     im = incident_metrics(test_df, y_prob, predictor.threshold, cfg)

@@ -24,6 +24,7 @@ from src.ml.features import (
 from src.ml.trainer import train as train_model
 from src.ml.evaluator import evaluate as evaluate_model
 from src.ml.predictor import Predictor
+from src.ml.synthetic import generate_synthetic_data
 from src.pipeline.ingest import NABClient, read_metric_stream
 from src.pipeline.alert_engine import AlertEngine
 from src.pipeline.notifier import ArchivingNotifier, SSENotifier, StdoutNotifier
@@ -66,6 +67,32 @@ def _build_dataset(filenames, client, windows_map, cfg):
     return train_df, val_df, test_df
 
 
+def _build_synthetic_dataset(cfg):
+    """Generate synthetic data and run it through the same feature/label/split pipeline."""
+    import pandas as pd
+    all_train, all_val, all_test = [], [], []
+    for source_id, df, windows in generate_synthetic_data():
+        labeled = label_series(df, windows, cfg.H)
+        windowed = build_window_df(labeled, source_id, cfg)
+        if len(windowed) < 10:
+            continue
+        tr, va, te = temporal_split(windowed, cfg)
+        if min(len(tr), len(va), len(te)) == 0:
+            continue
+        all_train.append(tr)
+        all_val.append(va)
+        all_test.append(te)
+        pos = int((tr["label"] == 1).sum())
+        logger.info("  {} -> {} windows (pos_train={})", source_id, len(windowed), pos)
+    if not all_train:
+        return None
+    return (
+        pd.concat(all_train, ignore_index=True),
+        pd.concat(all_val, ignore_index=True),
+        pd.concat(all_test, ignore_index=True),
+    )
+
+
 def _get_model_dir(artifacts_root: Path, source_id: str | None, cfg: Config) -> Path:
     """Return the model directory to use: per-metric if available, else global. Supports legacy layout."""
     models_root = artifacts_root / "models"
@@ -82,20 +109,24 @@ def _get_model_dir(artifacts_root: Path, source_id: str | None, cfg: Config) -> 
 
 def cmd_train(args: argparse.Namespace) -> None:
     cfg = Config()
+    dataset = getattr(args, "dataset", "aws")
     out = Path(args.artifacts)
     data_dir = out / "data"
     model_dir = out / "models"
     report_dir = out / "reports"
 
-    client = NABClient(cfg, local_path=args.local_nab)
-    windows_map = client.load_windows()
-
     import pandas as pd
     import json
 
-    # ---- Global model (all series) ----
-    logger.info("Building global dataset (all series)")
-    result = _build_dataset(list(cfg.aws_files), client, windows_map, cfg)
+    if dataset == "synthetic":
+        logger.info("Building synthetic dataset")
+        result = _build_synthetic_dataset(cfg)
+    else:
+        client = NABClient(cfg, local_path=args.local_nab)
+        windows_map = client.load_windows()
+        logger.info("Building global dataset (all series)")
+        result = _build_dataset(list(cfg.aws_files), client, windows_map, cfg)
+
     if result is None:
         logger.error("No series processed successfully.")
         sys.exit(1)
@@ -117,7 +148,13 @@ def cmd_train(args: argparse.Namespace) -> None:
         cfg,
     )
 
-    # ---- Per-metric models ----
+    if dataset == "synthetic":
+        (model_dir / "manifest.json").write_text(json.dumps({"models": ["global"]}, indent=2))
+        logger.info("Training complete. Models: ['global']")
+        return
+
+    # ---- Per-metric models (AWS only) ----
+    client = client  # already created above for aws path
     from collections import defaultdict
     by_key = defaultdict(list)
     for f in cfg.aws_files:
@@ -179,15 +216,34 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 def cmd_predict(args: argparse.Namespace) -> None:
     cfg = Config()
     out = Path(args.artifacts)
+    dataset = getattr(args, "dataset", "aws")
 
-    client = NABClient(cfg, local_path=args.local_nab)
-    matching = [f for f in cfg.aws_files if args.source in f]
-    if not matching:
-        logger.error("No source matching '{}'. Available: {}", args.source, cfg.aws_files)
-        sys.exit(1)
+    if dataset == "synthetic":
+        # Load synthetic series; match --source to a synthetic service name
+        from src.ml.synthetic import SERVICE_NAMES
+        source_id = args.source
+        matching = [s for s in SERVICE_NAMES if source_id.lower() in s]
+        if not matching:
+            logger.error(
+                "No synthetic source matching '{}'. Available: {}",
+                args.source, ", ".join(SERVICE_NAMES),
+            )
+            sys.exit(1)
+        source_id = matching[0]
+        # Generate all synthetic data and take the series we need
+        raw_dfs = {sid: df for sid, df, _ in generate_synthetic_data()}
+        raw = raw_dfs[source_id]
+        raw = raw[["timestamp", "value"]].sort_values("timestamp").reset_index(drop=True)
+    else:
+        client = NABClient(cfg, local_path=args.local_nab)
+        matching = [f for f in cfg.aws_files if args.source in f]
+        if not matching:
+            logger.error("No source matching '{}'. Available: {}", args.source, cfg.aws_files)
+            sys.exit(1)
+        filename = matching[0]
+        source_id = Path(filename).stem
+        raw = client.load_series(filename)
 
-    filename = matching[0]
-    source_id = Path(filename).stem
     model_dir = _get_model_dir(out, source_id, cfg)
     logger.info("Using model {} for source {}", model_dir.name, source_id)
 
@@ -196,7 +252,6 @@ def cmd_predict(args: argparse.Namespace) -> None:
         model_dir / "threshold.json",
     )
 
-    raw = client.load_series(filename)
     notifier: StdoutNotifier | ArchivingNotifier = StdoutNotifier()
     if getattr(args, "alert_log", None):
         notifier = ArchivingNotifier(notifier, args.alert_log)
@@ -216,6 +271,9 @@ def cmd_predict(args: argparse.Namespace) -> None:
 def cmd_stream(args: argparse.Namespace) -> None:
     """Read metrics from a file (or stdin) in a stream; output SSE events when
     the model predicts an incident (threshold crossed)."""
+    if args.input != "-" and not Path(args.input).exists():
+        logger.error("Input file not found: {}", args.input)
+        sys.exit(1)
     cfg = Config()
     out = Path(args.artifacts)
     source_id = args.source or "stream"
@@ -229,7 +287,8 @@ def cmd_stream(args: argparse.Namespace) -> None:
     notifier: SSENotifier | ArchivingNotifier = SSENotifier()
     if getattr(args, "alert_log", None):
         notifier = ArchivingNotifier(notifier, args.alert_log)
-    engine = AlertEngine(predictor, cfg, notifier=notifier)
+    debug = getattr(args, "debug", False)
+    engine = AlertEngine(predictor, cfg, notifier=notifier, debug=debug)
 
     # Optional: send SSE comment so clients know the stream started
     sys.stdout.write(": stream started\n\n")
@@ -240,6 +299,8 @@ def cmd_stream(args: argparse.Namespace) -> None:
         count += 1
         engine.ingest(ts, value, source_id)
 
+    if debug:
+        logger.info("Debug: max probability = {:.4f} (alert threshold = {:.2f})", engine.max_prob_seen, predictor.threshold)
     logger.info("Stream finished. {} points processed, {} alerts fired.", count, len(engine.alerts_fired))
 
 
@@ -254,6 +315,7 @@ def main() -> None:
     # train
     p_train = sub.add_parser("train", help="Prepare data, train model, evaluate")
     p_train.add_argument("--artifacts", default=str(ARTIFACTS_DEFAULT))
+    p_train.add_argument("--dataset", choices=["aws", "synthetic"], default="aws", help="Data source: NAB AWS data or generated synthetic data")
     p_train.add_argument("--local-nab", default=None, help="Path to local NAB clone")
 
     # evaluate
@@ -263,6 +325,7 @@ def main() -> None:
     # predict
     p_pred = sub.add_parser("predict", help="Run alerting pipeline on a metric source")
     p_pred.add_argument("--source", required=True, help="Source name (partial match)")
+    p_pred.add_argument("--dataset", choices=["aws", "synthetic"], default="aws", help="Data source: NAB AWS or synthetic (use with --source for synthetic service name)")
     p_pred.add_argument("--artifacts", default=str(ARTIFACTS_DEFAULT))
     p_pred.add_argument("--local-nab", default=None, help="Path to local NAB clone")
     p_pred.add_argument("--alert-log", default=None, help="Append alerts to this file (JSON lines) for archival")
@@ -273,6 +336,7 @@ def main() -> None:
     p_stream.add_argument("--source", default="stream", help="Source id for alert payloads")
     p_stream.add_argument("--artifacts", default=str(ARTIFACTS_DEFAULT))
     p_stream.add_argument("--alert-log", default=None, help="Append alerts to this file (JSON lines) for archival")
+    p_stream.add_argument("--debug", action="store_true", help="Log probability when > 0.15 and max prob at end")
 
     args = parser.parse_args()
 
